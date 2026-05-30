@@ -59,6 +59,6 @@ async def on_message(message):
             await message.clear_reactions()
     await bot.process_commands(message)
 
-load_dotenv()
-TOKEN = str(os.getenv('DISCORD_BOT_TOKEN'))
+load_dotenv(override=False)
+TOKEN = str(os.environ.get('DISCORD_BOT_TOKEN'))
 bot.run(TOKEN)
