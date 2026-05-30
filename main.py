@@ -21,21 +21,6 @@ def get_ytdl_opts(download_path):
         'no_warnings': True,
     }
 
-
-async def override_with_webhook(message, output_file):
-    webhook = await message.channel.create_webhook(name="Media Mirror")
-    try:
-        await message.delete()
-        await webhook.send(
-            content=message.content,
-            file=discord.File(output_file),
-            username=message.author.display_name,
-            avatar_url=message.author.display_avatar.url
-        )
-    finally:
-        # 4. Clean up and delete the temporary webhook so you don't hit server limits
-        await webhook.delete()
-
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user.name} ({bot.user.id})')
