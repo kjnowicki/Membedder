@@ -4,6 +4,7 @@ import asyncio
 import discord
 from discord.ext import commands
 import yt_dlp
+from dotenv import load_dotenv
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -73,4 +74,6 @@ async def on_message(message):
             await message.clear_reactions()
     await bot.process_commands(message)
 
-bot.run('MTUwOTk3NTE5NzY3NDExNTI1Ng.GoVM4A.cEy25_Qvas4McUV8JAG6k6cZpPw1rrsIG6LcvA')
+load_dotenv()
+TOKEN = str(os.getenv('DISCORD_BOT_TOKEN'))
+bot.run(TOKEN)
