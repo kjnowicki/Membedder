@@ -64,14 +64,13 @@ async def on_message(message):
                     await message.edit(suppress=True)
                     os.remove(filename)
                 else:
-                    await message.add_reaction("❌")
+                    print(f"File {filename} was not found!")
 
             except yt_dlp.utils.DownloadError as e:
-                await message.add_reaction("⚠️")
                 print(f"yt-dlp error: {e}")
             except Exception as e:
-                await message.add_reaction("⚠️")
                 print(f"General error: {e}")
+            await message.clear_reactions()
     await bot.process_commands(message)
 
 bot.run('MTUwOTk3NTE5NzY3NDExNTI1Ng.GoVM4A.cEy25_Qvas4McUV8JAG6k6cZpPw1rrsIG6LcvA')
