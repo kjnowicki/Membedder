@@ -55,6 +55,8 @@ async def handle_x(url, temp_dir):
                     'uploader_url': info.get('uploader_url'),
                     'webpage_url': info.get('webpage_url'),
                     'description': info.get('description'),
+                    'thumbnail': info.get('thumbnail'),
+                    'height': info.get('height'),
                 }
             else:
                 filename = ydl.prepare_filename(info)
@@ -67,6 +69,8 @@ async def handle_x(url, temp_dir):
                         'uploader_url': info.get('uploader_url'),
                         'webpage_url': info.get('webpage_url'),
                         'description': info.get('description'),
+                        'thumbnail': info.get('thumbnail'),
+                        'height': info.get('height'),
                     }
                 else:
                     info_id = info.get('id')
@@ -81,6 +85,8 @@ async def handle_x(url, temp_dir):
                                     'uploader_url': info.get('uploader_url'),
                                     'webpage_url': info.get('webpage_url'),
                                     'description': info.get('description'),
+                                    'thumbnail': info.get('thumbnail'),
+                                    'height': info.get('height'),
                                 }
                     return {
                         'title': tweet_text,
@@ -91,6 +97,8 @@ async def handle_x(url, temp_dir):
                         'uploader_url': info.get('uploader_url'),
                         'webpage_url': info.get('webpage_url'),
                         'description': info.get('description'),
+                        'thumbnail': info.get('thumbnail'),
+                        'height': info.get('height'),
                     }
     except Exception as e:
         return {

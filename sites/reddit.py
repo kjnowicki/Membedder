@@ -7,6 +7,40 @@ import aiohttp
 import http.cookiejar
 from urllib.parse import urlparse, urlunparse
 
+def load_reddit_cookies():
+    cookies = {}
+    found_any = False
+    for cookie_file in ['cookies/www.reddit.com_cookies.txt', 'cookies/www.reddit.com_cookies.json']:
+        if os.path.exists(cookie_file):
+            found_any = True
+            # Try loading as JSON first (common format from browser extensions)
+            try:
+                with open(cookie_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        for item in data:
+                            if isinstance(item, dict) and 'name' in item and 'value' in item:
+                                cookies[item['name']] = item['value']
+                        if cookies:
+                            return cookies, True
+            except json.JSONDecodeError:
+                # Not a JSON file, fall through to Netscape format
+                pass
+            except Exception as e:
+                print(f"[REDDIT] Error reading JSON cookies from {cookie_file}: {e}")
+
+            # Fall back to MozillaCookieJar (Netscape text format)
+            try:
+                cookie_jar = http.cookiejar.MozillaCookieJar(cookie_file)
+                cookie_jar.load(ignore_discard=True, ignore_expires=True)
+                for cookie in cookie_jar:
+                    cookies[cookie.name] = cookie.value
+                if cookies:
+                    return cookies, True
+            except Exception as e:
+                print(f"[REDDIT] Error loading cookies from {cookie_file} using MozillaCookieJar: {e}")
+    return cookies, found_any
+
 async def get_reddit_json(url):
     # Normalize URL: extract subreddit and post ID
     # e.g., https://www.reddit.com/r/aww/comments/18x7p68/my_dog_waiting_for_me/ -> sub='aww', post_id='18x7p68'
@@ -29,18 +63,7 @@ async def resolve_and_get_reddit_json(url):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    # Load cookies
-    cookies = {}
-    for cookie_file in ['cookies/www.reddit.com_cookies.txt', 'cookies/www.reddit.com_cookies.json']:
-        if os.path.exists(cookie_file):
-            try:
-                cookie_jar = http.cookiejar.MozillaCookieJar(cookie_file)
-                cookie_jar.load(ignore_discard=True, ignore_expires=True)
-                for cookie in cookie_jar:
-                    cookies[cookie.name] = cookie.value
-                break
-            except Exception as e:
-                print(f"Error loading cookies: {e}")
+    cookies, _ = load_reddit_cookies()
 
     async with aiohttp.ClientSession(cookies=cookies, headers=headers) as session:
         try:
@@ -48,7 +71,7 @@ async def resolve_and_get_reddit_json(url):
                 resolved_url = str(resp.url)
                 return await get_reddit_json(resolved_url)
         except Exception as e:
-            print(f"Failed to resolve URL: {e}")
+            print(f"[REDDIT] Failed to resolve URL {url}: {e}")
     return None
 
 async def fetch_reddit_json_by_id(sub, post_id):
@@ -57,17 +80,10 @@ async def fetch_reddit_json_by_id(sub, post_id):
     }
 
     # Tier 1: Try using cookies if available
-    cookies = {}
-    for cookie_file in ['cookies/www.reddit.com_cookies.txt', 'cookies/www.reddit.com_cookies.json']:
-        if os.path.exists(cookie_file):
-            try:
-                cookie_jar = http.cookiejar.MozillaCookieJar(cookie_file)
-                cookie_jar.load(ignore_discard=True, ignore_expires=True)
-                for cookie in cookie_jar:
-                    cookies[cookie.name] = cookie.value
-                break
-            except Exception as e:
-                print(f"Error loading reddit cookies from {cookie_file}: {e}")
+    cookies, files_exist = load_reddit_cookies()
+
+    if not files_exist:
+        print("[REDDIT INFO] No cookie files found. (cookies/www.reddit.com_cookies.txt/json)")
 
     if cookies:
         api_url = f"https://www.reddit.com/r/{sub}/comments/{post_id}/.json"
@@ -76,9 +92,14 @@ async def fetch_reddit_json_by_id(sub, post_id):
                 async with session.get(api_url) as resp:
                     if resp.status == 200:
                         return await resp.json()
-                    print(f"Fetch with cookies returned status {resp.status}")
+                    
+                    if resp.status in [401, 403, 429]:
+                        print(f"[REDDIT WARNING] Request with cookies returned status {resp.status}. Your cookies might be expired or invalid.")
+                    else:
+                        print(f"[REDDIT] Fetch with cookies returned status {resp.status}")
             except Exception as e:
-                print(f"Fetch with cookies failed: {e}")
+                print(f"[REDDIT] Fetch with cookies failed: {e}")
+
 
     # Tier 2: Try using Client ID & Secret if configured in .env
     client_id = os.environ.get('REDDIT_CLIENT_ID')
@@ -376,9 +397,19 @@ async def handle_reddit(url, temp_dir):
                 print(f"yt-dlp fallback download failed for {post_url}: {e}")
 
     # Return structure with title and downloaded files
+    thumbnail_url = post_data.get('thumbnail') if post_data.get('thumbnail') and post_data.get('thumbnail').startswith('http') else None
+    height = reddit_video.get('height') if reddit_video else None
+    if 'info' in locals() and info:
+        if not thumbnail_url:
+            thumbnail_url = info.get('thumbnail')
+        if not height:
+            height = info.get('height')
+
     return {
         'title': title,
         'files': files,
         'subreddit': post_data.get('subreddit_name_prefixed') or f"r/{post_data.get('subreddit')}" if 'post_data' in locals() and post_data else None,
-        'webpage_url': f"https://www.reddit.com{post_data.get('permalink')}" if 'post_data' in locals() and post_data and post_data.get('permalink') else url
+        'webpage_url': f"https://www.reddit.com{post_data.get('permalink')}" if 'post_data' in locals() and post_data and post_data.get('permalink') else url,
+        'thumbnail': thumbnail_url,
+        'height': height
     }
