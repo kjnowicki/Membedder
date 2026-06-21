@@ -1,18 +1,38 @@
 import os
 import re
 import asyncio
+import subprocess
 import discord
 from discord.ext import commands
-import yt_dlp
 from dotenv import load_dotenv
+
+# Import platform handlers
+from sites.instagram import handle_instagram
+from sites.x import handle_x
+from sites.reddit import handle_reddit
+from sites.facebook import handle_facebook
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-URL_REGEX = r'(https?://(?:www\.)?(?:instagram\.com|x\.com)/[^\s]+)'
+URL_REGEX = r'(https?://(?:www\.|m\.)?(?:instagram\.com|x\.com|twitter\.com|reddit\.com|old\.reddit\.com|v\.redd\.it|facebook\.com|fb\.watch)/[^\s]+)'
 
-import subprocess
+def truncate_text(text, max_chars=200, max_lines=3):
+    if not text:
+        return ""
+    lines = text.splitlines()
+    if len(lines) > max_lines:
+        truncated = "\n".join(lines[:max_lines])
+        if not truncated.endswith("[...]"):
+            text = truncated + "\n[...]"
+        else:
+            text = truncated
+            
+    if len(text) > max_chars:
+        text = text[:max_chars - 6].rstrip()
+        text += " [...]"
+    return text
 
 async def compress_video(input_path, output_path, target_size_mb=24):
     target_size_bytes = target_size_mb * 1024 * 1024
@@ -45,15 +65,6 @@ async def compress_video(input_path, output_path, target_size_mb=24):
         if log_file.startswith('ffmpeg2pass'):
             os.remove(log_file)
 
-def get_ytdl_opts(download_path):
-    return {
-        'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
-        'outtmpl': os.path.join(download_path, '%(id)s.%(ext)s'),
-        'max_filesize': 100 * 1024 * 1024,
-        'quiet': True,
-        'no_warnings': True,
-    }
-
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user.name} ({bot.user.id})')
@@ -71,35 +82,202 @@ async def on_message(message):
 
         async with message.channel.typing():
             try:
-                loop = asyncio.get_event_loop()
-                ydl_opts = get_ytdl_opts('temp')
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
-                    filename = ydl.prepare_filename(info)
+                res = None
+                if "instagram.com" in url:
+                    res = await handle_instagram(url, 'temp')
+                elif "x.com" in url or "twitter.com" in url:
+                    res = await handle_x(url, 'temp')
+                elif "reddit.com" in url or "old.reddit.com" in url or "v.redd.it" in url:
+                    res = await handle_reddit(url, 'temp')
+                elif "facebook.com" in url or "fb.watch" in url:
+                    res = await handle_facebook(url, 'temp')
 
-                if os.path.exists(filename):
-                    file_size = os.path.getsize(filename)
-                    max_discord_size = 9 * 1024 * 1024
+                if res:
+                    if res.get('error'):
+                        print(f"Error handling URL {url}: {res['error']}")
+                    
+                    exceeded_limit = False
+                    files_to_upload = []
+                    for filepath in res.get('files', []):
+                        if os.path.exists(filepath):
+                            file_size = os.path.getsize(filepath)
+                            max_discord_size = 9 * 1024 * 1024
+                            
+                            final_filepath = filepath
+                            # Compress video files if they exceed the Discord size limit
+                            if filepath.lower().endswith('.mp4') and file_size > max_discord_size:
+                                if file_size <= 100 * 1024 * 1024:
+                                    compressed_filename = filepath.replace(".mp4", "_compressed.mp4")
+                                    await compress_video(filepath, compressed_filename, target_size_mb=9)
+                                    if os.path.exists(compressed_filename):
+                                        os.remove(filepath)
+                                        final_filepath = compressed_filename
+                                else:
+                                    exceeded_limit = True
+                                    if not res.get('height'):
+                                        try:
+                                            cmd_probe = f'ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 "{filepath}"'
+                                            probe_output = subprocess.check_output(cmd_probe, shell=True).decode('utf-8').strip()
+                                            if probe_output.isdigit():
+                                                res['height'] = int(probe_output)
+                                        except Exception as e:
+                                            print(f"Error probing height for large file {filepath}: {e}")
+                                    continue
+                            
+                            files_to_upload.append(final_filepath)
 
-                    final_upload_file = filename
+                    if files_to_upload or exceeded_limit:
+                        discord_files = [discord.File(f) for f in files_to_upload]
+                        
+                        # Custom layout for X/Twitter posts
+                        if "x.com" in url or "twitter.com" in url:
+                            raw_desc = res.get('description') or res.get('title') or ""
+                            # Remove trailing t.co short links if they are at the end
+                            cleaned_desc = re.sub(r'\s*https://t\.co/\w+\s*$', '', raw_desc)
+                            cleaned_desc = truncate_text(cleaned_desc)
+                            
+                            embed = discord.Embed(
+                                description=cleaned_desc,
+                                color=0x1DA1F2  # X / Twitter blue color
+                            )
+                            
+                            uploader = res.get('uploader')
+                            uploader_id = res.get('uploader_id')
+                            author_name = uploader or uploader_id or "X User"
+                            if uploader and uploader_id and uploader.lower() != uploader_id.lower():
+                                author_name = f"{uploader} (@{uploader_id})"
+                                
+                            post_url = res.get('webpage_url') or url
+                            embed.set_author(name=author_name, url=post_url)
+                            
+                            if exceeded_limit:
+                                thumbnail_url = res.get('thumbnail')
+                                if thumbnail_url:
+                                    embed.set_image(url=thumbnail_url)
+                                height = res.get('height')
+                                footer_text = "Video exceeded 100MB, view it at original link"
+                                if height:
+                                    footer_text += f" ({height}px)"
+                                embed.set_footer(text=footer_text)
+                                
+                            await message.reply(embed=embed, files=discord_files, mention_author=False)
+                        elif "reddit.com" in url or "old.reddit.com" in url or "v.redd.it" in url:
+                            raw_desc = res.get('title') or ""
+                            cleaned_desc = truncate_text(raw_desc)
+                            
+                            embed = discord.Embed(
+                                description=cleaned_desc,
+                                color=0xFF4500  # Reddit Orangered color
+                            )
+                            
+                            subreddit = res.get('subreddit') or "r/reddit"
+                            post_url = res.get('webpage_url') or url
+                            embed.set_author(name=subreddit, url=post_url)
+                            
+                            if exceeded_limit:
+                                thumbnail_url = res.get('thumbnail')
+                                if thumbnail_url:
+                                    embed.set_image(url=thumbnail_url)
+                                height = res.get('height')
+                                footer_text = "Video exceeded 100MB, view it at original link"
+                                if height:
+                                    footer_text += f" ({height}px)"
+                                embed.set_footer(text=footer_text)
+                                
+                            await message.reply(embed=embed, files=discord_files, mention_author=False)
+                        elif "instagram.com" in url:
+                            raw_desc = res.get('description') or res.get('title') or ""
+                            cleaned_desc = truncate_text(raw_desc)
+                            
+                            embed = discord.Embed(
+                                description=cleaned_desc,
+                                color=0xE1306C  # Instagram Cherry Pink color
+                            )
+                            
+                            uploader = res.get('uploader')
+                            uploader_id = res.get('uploader_id')
+                            author_name = uploader or uploader_id or "Instagram User"
+                            if uploader and uploader_id and uploader.lower() != uploader_id.lower():
+                                author_name = f"{uploader} (@{uploader_id})"
+                                
+                            post_url = res.get('webpage_url') or url
+                            embed.set_author(name=author_name, url=post_url)
+                            
+                            if exceeded_limit:
+                                thumbnail_url = res.get('thumbnail')
+                                if thumbnail_url:
+                                    embed.set_image(url=thumbnail_url)
+                                height = res.get('height')
+                                footer_text = "Video exceeded 100MB, view it at original link"
+                                if height:
+                                    footer_text += f" ({height}px)"
+                                embed.set_footer(text=footer_text)
+                                
+                            await message.reply(embed=embed, files=discord_files, mention_author=False)
+                        elif "facebook.com" in url or "fb.watch" in url:
+                            raw_desc = res.get('description') or res.get('title') or ""
+                            cleaned_desc = truncate_text(raw_desc)
+                            
+                            embed = discord.Embed(
+                                description=cleaned_desc,
+                                color=0x1877F2  # Facebook Blue color
+                            )
+                            
+                            uploader = res.get('uploader')
+                            uploader_id = res.get('uploader_id')
+                            author_name = uploader or uploader_id or "Facebook User"
+                            if uploader and uploader_id and uploader.lower() != uploader_id.lower():
+                                author_name = f"{uploader} (@{uploader_id})"
+                                
+                            post_url = res.get('webpage_url') or url
+                            embed.set_author(name=author_name, url=post_url)
+                            
+                            if exceeded_limit:
+                                thumbnail_url = res.get('thumbnail')
+                                if thumbnail_url:
+                                    embed.set_image(url=thumbnail_url)
+                                height = res.get('height')
+                                footer_text = "Video exceeded 100MB, view it at original link"
+                                if height:
+                                    footer_text += f" ({height}px)"
+                                embed.set_footer(text=footer_text)
+                                
+                            await message.reply(embed=embed, files=discord_files, mention_author=False)
+                        else:
+                            if exceeded_limit:
+                                embed = discord.Embed(
+                                    title=res.get('title') or "Video",
+                                    url=res.get('webpage_url') or url
+                                )
+                                thumbnail_url = res.get('thumbnail')
+                                if thumbnail_url:
+                                    embed.set_image(url=thumbnail_url)
+                                height = res.get('height')
+                                footer_text = "Video exceeded 100MB, view it at original link"
+                                if height:
+                                    footer_text += f" ({height}px)"
+                                embed.set_footer(text=footer_text)
+                                await message.reply(embed=embed, mention_author=False)
+                            else:
+                                content = res.get('title')
+                                await message.reply(content=content, files=discord_files, mention_author=False)
+                            
+                        await message.edit(suppress=True)
+                        for f in res.get('files', []):
+                            if os.path.exists(f):
+                                try:
+                                    os.remove(f)
+                                except Exception:
+                                    pass
+                        for f in files_to_upload:
+                            if os.path.exists(f):
+                                try:
+                                    os.remove(f)
+                                except Exception:
+                                    pass
+                    else:
+                        print(f"No files were extracted/found for URL: {url}")
 
-                    if file_size > max_discord_size:
-                        compressed_filename = filename.replace(".mp4", "_compressed.mp4")
-                        await compress_video(filename, compressed_filename, target_size_mb=9)
-                        if os.path.exists(compressed_filename):
-                            os.remove(filename)
-                            final_upload_file = compressed_filename
-
-                    discord_file = discord.File(final_upload_file)
-                    await message.reply(file=discord_file, mention_author=False)
-                    await message.edit(suppress=True)
-                    if os.path.exists(final_upload_file):
-                        os.remove(final_upload_file)
-                else:
-                    print(f"File {filename} was not found!")
-
-            except yt_dlp.utils.DownloadError as e:
-                print(f"yt-dlp error: {e}")
             except Exception as e:
                 print(f"General error: {e}")
             await message.clear_reactions()
