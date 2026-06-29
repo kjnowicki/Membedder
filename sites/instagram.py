@@ -1,6 +1,7 @@
 import os
 import asyncio
 import yt_dlp
+from sites.cookies import get_cookie_opts, ytdl_extract_info
 
 def get_ytdl_opts(download_path):
     opts = {
@@ -10,10 +11,9 @@ def get_ytdl_opts(download_path):
         'quiet': True,
         'no_warnings': True,
     }
-    # Check for instagram cookies
-    cookie_file = 'cookies/instagram.com_cookies.txt'
-    if os.path.exists(cookie_file):
-        opts['cookiefile'] = cookie_file
+    # Check for instagram cookies (handles txt, json, and browser fallbacks)
+    cookie_opts = get_cookie_opts('instagram', download_path)
+    opts.update(cookie_opts)
     return opts
 
 async def handle_instagram(url, temp_dir):
@@ -21,21 +21,25 @@ async def handle_instagram(url, temp_dir):
     ydl_opts = get_ytdl_opts(temp_dir)
     
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
-            if not info:
-                return {
-                    'title': '',
-                    'files': [],
-                    'error': 'Failed to extract Instagram post info'
-                }
-            
-            caption = info.get('description') or info.get('title') or ""
-            
+        info = await ytdl_extract_info(ydl_opts, url, loop)
+        if not info:
+            return {
+                'title': '',
+                'files': [],
+                'error': 'Failed to extract Instagram post info'
+            }
+        
+        caption = info.get('description') or info.get('title') or ""
+        
+        clean_opts = ydl_opts.copy()
+        clean_opts.pop('cookiefile', None)
+        clean_opts.pop('cookiesfrombrowser', None)
+        with yt_dlp.YoutubeDL(clean_opts) as ydl:
             # Instagram post can be a carousel (playlist type in yt_dlp)
             if info.get('_type') == 'playlist':
                 files = []
                 for entry in info.get('entries', []):
+
                     if entry:
                         # Sometimes entry is just a minimal dict, sometimes full.
                         # ydl.prepare_filename requires key metadata.

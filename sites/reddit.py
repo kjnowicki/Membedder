@@ -357,6 +357,7 @@ async def handle_reddit(url, temp_dir):
         is_self = post_data.get('is_self', False)
         if not is_self and (post_hint in ['rich:video', 'hosted:video'] or post_data.get('media') or post_data.get('secure_media')):
             import yt_dlp
+            from sites.cookies import get_cookie_opts, ytdl_extract_info
             ydl_opts = {
                 'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
                 'outtmpl': os.path.join(temp_dir, '%(id)s.%(ext)s'),
@@ -364,11 +365,18 @@ async def handle_reddit(url, temp_dir):
                 'quiet': True,
                 'no_warnings': True,
             }
+            # Check for reddit cookies (handles txt, json, and browser fallbacks)
+            cookie_opts = get_cookie_opts('reddit', temp_dir)
+            ydl_opts.update(cookie_opts)
+
             loop = asyncio.get_event_loop()
             try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = await loop.run_in_executor(None, lambda: ydl.extract_info(post_url, download=True))
-                    if info:
+                info = await ytdl_extract_info(ydl_opts, post_url, loop)
+                if info:
+                    clean_opts = ydl_opts.copy()
+                    clean_opts.pop('cookiefile', None)
+                    clean_opts.pop('cookiesfrombrowser', None)
+                    with yt_dlp.YoutubeDL(clean_opts) as ydl:
                         if info.get('_type') == 'playlist':
                             for entry in info.get('entries', []):
                                 if entry:
@@ -393,6 +401,7 @@ async def handle_reddit(url, temp_dir):
                                         if f.startswith(info_id):
                                             files.append(os.path.join(temp_dir, f))
                                             break
+
             except Exception as e:
                 print(f"yt-dlp fallback download failed for {post_url}: {e}")
 

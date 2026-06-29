@@ -1,6 +1,7 @@
 import os
 import asyncio
 import yt_dlp
+from sites.cookies import get_cookie_opts, ytdl_extract_info
 
 def get_ytdl_opts(download_path):
     opts = {
@@ -10,10 +11,9 @@ def get_ytdl_opts(download_path):
         'quiet': True,
         'no_warnings': True,
     }
-    # Check for facebook cookies
-    cookie_file = 'cookies/facebook.com_cookies.txt'
-    if os.path.exists(cookie_file):
-        opts['cookiefile'] = cookie_file
+    # Check for facebook cookies (handles txt, json, and browser fallbacks)
+    cookie_opts = get_cookie_opts('facebook', download_path)
+    opts.update(cookie_opts)
     return opts
 
 async def handle_facebook(url, temp_dir):
@@ -21,22 +21,26 @@ async def handle_facebook(url, temp_dir):
     ydl_opts = get_ytdl_opts(temp_dir)
     
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
-            if not info:
-                return {
-                    'title': '',
-                    'files': [],
-                    'error': 'Failed to extract Facebook post info'
-                }
-            
-            caption = info.get('description') or info.get('title') or ""
-            
+        info = await ytdl_extract_info(ydl_opts, url, loop)
+        if not info:
+            return {
+                'title': '',
+                'files': [],
+                'error': 'Failed to extract Facebook post info'
+            }
+        
+        caption = info.get('description') or info.get('title') or ""
+        
+        clean_opts = ydl_opts.copy()
+        clean_opts.pop('cookiefile', None)
+        clean_opts.pop('cookiesfrombrowser', None)
+        with yt_dlp.YoutubeDL(clean_opts) as ydl:
             if info.get('_type') == 'playlist':
                 files = []
                 for entry in info.get('entries', []):
                     if entry:
                         try:
+
                             filename = ydl.prepare_filename(entry)
                             if os.path.exists(filename):
                                 files.append(filename)
