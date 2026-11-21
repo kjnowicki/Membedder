@@ -1,5 +1,7 @@
 .env
+_deploy/
 cookies/
+data/
 temp/
 __pycache__/
 *.mp4

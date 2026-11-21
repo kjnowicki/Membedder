@@ -1,0 +1,117 @@
+name: Deploy Membedder
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-membedder
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, Windows, X64]
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+
+      - name: Build and restart Membedder container
+        shell: powershell
+        env:
+          RUNTIME_DIR: ${{ vars.MEMBEDDER_RUNTIME_DIR || 'D:/Projects/Repos/Membedder/_deploy' }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $runtimeDir = ($env:RUNTIME_DIR -replace '\\', '/').TrimEnd('/')
+          Write-Host "Using runtime directory: $runtimeDir"
+
+          if (-not (Test-Path "$runtimeDir/.env")) {
+            throw "Missing .env file at '$runtimeDir/.env'. Set repo variable MEMBEDDER_RUNTIME_DIR if your runtime folder is elsewhere."
+          }
+
+          New-Item -ItemType Directory -Force -Path "$runtimeDir/cookies" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$runtimeDir/data" | Out-Null
+
+          $hasWinDocker = [bool](Get-Command docker -ErrorAction SilentlyContinue)
+
+          if ($hasWinDocker) {
+            $env:RUNTIME_DIR = $runtimeDir
+
+            $useComposeV2 = $false
+            $prevPref = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            & docker compose version *> $null
+            if ($LASTEXITCODE -eq 0) { $useComposeV2 = $true }
+            $ErrorActionPreference = $prevPref
+
+            function Invoke-Compose {
+              param([string[]]$ComposeArgs)
+              if ($useComposeV2) {
+                & docker compose -p membedder @ComposeArgs
+              } else {
+                & docker-compose -p membedder @ComposeArgs
+              }
+              if ($LASTEXITCODE -ne 0) {
+                throw "Docker Compose failed with exit code $LASTEXITCODE"
+              }
+            }
+
+            # 1. Build new image first so the running bot stays online if the build fails
+            Invoke-Compose @("build")
+
+            # 2. Remove any pre-existing container (handles migration from an older compose project name)
+            $existing = & docker ps -aq -f "name=^membedder-container$"
+            if ($existing) {
+              & docker rm -f membedder-container | Out-Null
+            }
+
+            # 3. Start updated container
+            Invoke-Compose @("up", "-d", "--force-recreate")
+
+            # 4. Clean up dangling images from previous builds
+            & docker image prune -f | Out-Null
+            & docker ps -f "name=^membedder-container$"
+          }
+          elseif (Get-Command wsl -ErrorAction SilentlyContinue) {
+            $wslRuntimeDir = (& wsl wslpath -u "$runtimeDir").Trim()
+            if ($LASTEXITCODE -ne 0 -or -not $wslRuntimeDir) {
+              throw "Failed to translate '$runtimeDir' to a WSL path."
+            }
+            Write-Host "Windows docker CLI not found; using WSL Docker with RUNTIME_DIR=$wslRuntimeDir"
+
+            $useComposeV2 = $false
+            $prevPref = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            & wsl docker compose version *> $null
+            if ($LASTEXITCODE -eq 0) { $useComposeV2 = $true }
+            $ErrorActionPreference = $prevPref
+
+            function Invoke-WslCompose {
+              param([string[]]$ComposeArgs)
+              if ($useComposeV2) {
+                & wsl env "RUNTIME_DIR=$wslRuntimeDir" docker compose -p membedder @ComposeArgs
+              } else {
+                & wsl env "RUNTIME_DIR=$wslRuntimeDir" docker-compose -p membedder @ComposeArgs
+              }
+              if ($LASTEXITCODE -ne 0) {
+                throw "WSL Docker Compose failed with exit code $LASTEXITCODE"
+              }
+            }
+
+            Invoke-WslCompose @("build")
+
+            $existing = & wsl docker ps -aq -f "name=^membedder-container$"
+            if ($existing) {
+              & wsl docker rm -f membedder-container | Out-Null
+            }
+
+            Invoke-WslCompose @("up", "-d", "--force-recreate")
+            & wsl docker image prune -f | Out-Null
+            & wsl docker ps -f "name=^membedder-container$"
+          }
+          else {
+            throw "Neither Windows 'docker' nor 'wsl' was found on PATH."
+          }

@@ -4,6 +4,7 @@ services:
     container_name: membedder-container
     restart: always
     env_file:
-      - .env
+      - ${RUNTIME_DIR:-.}/.env
     volumes:
-      - ./cookies:/app/cookies
+      - ${RUNTIME_DIR:-.}/cookies:/app/cookies
+      - ${RUNTIME_DIR:-.}/data:/app/data
