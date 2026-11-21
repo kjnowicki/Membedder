@@ -1,0 +1,52 @@
+name: PR Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Unit Tests & Syntax Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Bytecode syntax check
+        run: python -m compileall -q main.py carousel.py config.py tracker.py sites tests
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+  docker:
+    name: Docker Build & Compose Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate docker-compose.yml
+        run: |
+          touch .env
+          docker compose config -q
+          rm -f .env
+
+      - name: Verify Docker image builds
+        run: docker build -t membedder:ci-test .

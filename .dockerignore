@@ -4,6 +4,7 @@
 .dockerignore
 .venv
 __pycache__/
+tests/
 temp/
 _deploy/
 cookies/
