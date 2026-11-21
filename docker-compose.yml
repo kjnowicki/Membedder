@@ -1,0 +1,9 @@
+services:
+  membedder-bot:
+    build: .
+    container_name: membedder-container
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./cookies:/app/cookies

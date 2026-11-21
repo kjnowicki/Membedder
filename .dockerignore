@@ -1,0 +1,11 @@
+.git
+.gitignore
+.dockerignore
+.venv
+__pycache__
+temp/
+cookies/
+.env
+*.mp4
+*.mp3
+*.m4a
