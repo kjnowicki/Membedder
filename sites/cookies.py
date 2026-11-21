@@ -1,5 +1,99 @@
 import os
 import json
+import http.cookiejar
+
+
+def _get_candidate_cookie_files(platform):
+    if platform == 'instagram':
+        return [
+            'cookies/instagram.com_cookies.txt',
+            'cookies/www.instagram.com_cookies.txt',
+            'cookies/instagram.com_cookies.json',
+            'cookies/www.instagram.com_cookies.json',
+        ]
+    elif platform == 'facebook':
+        return [
+            'cookies/facebook.com_cookies.txt',
+            'cookies/www.facebook.com_cookies.txt',
+            'cookies/facebook.com_cookies.json',
+            'cookies/www.facebook.com_cookies.json',
+        ]
+    elif platform == 'x':
+        return [
+            'cookies/x.com_cookies.txt',
+            'cookies/www.x.com_cookies.txt',
+            'cookies/twitter.com_cookies.txt',
+            'cookies/www.twitter.com_cookies.txt',
+            'cookies/x.com_cookies.json',
+            'cookies/www.x.com_cookies.json',
+            'cookies/twitter.com_cookies.json',
+            'cookies/www.twitter.com_cookies.json',
+        ]
+    elif platform == 'reddit':
+        return [
+            'cookies/reddit.com_cookies.txt',
+            'cookies/www.reddit.com_cookies.txt',
+            'cookies/reddit.com_cookies.json',
+            'cookies/www.reddit.com_cookies.json',
+        ]
+    return []
+
+
+def load_cookies_dict(platform):
+    """
+    Loads cookies for a platform from candidate .txt (Netscape) or .json files
+    into a {name: value} dictionary suitable for aiohttp.
+    """
+    cookies = {}
+    for cookie_file in _get_candidate_cookie_files(platform):
+        if not os.path.exists(cookie_file):
+            continue
+
+        if cookie_file.endswith('.json'):
+            try:
+                with open(cookie_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and 'name' in item and 'value' in item:
+                            cookies[item['name']] = item['value']
+                if cookies:
+                    return cookies
+            except Exception as e:
+                print(f"[COOKIES] Error loading JSON cookies from {cookie_file}: {e}")
+        else:
+            # Parse Netscape cookies file (also handling #HttpOnly_ lines that MozillaCookieJar skips)
+            try:
+                jar = http.cookiejar.MozillaCookieJar(cookie_file)
+                jar.load(ignore_discard=True, ignore_expires=True)
+                for c in jar:
+                    cookies[c.name] = c.value
+            except Exception as e:
+                print(f"[COOKIES] Error loading Netscape cookies via MozillaCookieJar from {cookie_file}: {e}")
+
+            try:
+                with open(cookie_file, 'r', encoding='utf-8') as f:
+                    for raw_line in f:
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        if line.startswith('#HttpOnly_'):
+                            line = line[len('#HttpOnly_'):]
+                        elif line.startswith('#'):
+                            continue
+                        parts = line.split('\t')
+                        if len(parts) >= 7:
+                            name = parts[5]
+                            value = parts[6]
+                            if name and name not in cookies:
+                                cookies[name] = value
+            except Exception as e:
+                print(f"[COOKIES] Error reading Netscape cookie file {cookie_file}: {e}")
+
+            if cookies:
+                return cookies
+
+    return cookies
 
 def json_to_netscape(json_path, netscape_path):
     """
@@ -54,39 +148,7 @@ def get_cookie_opts(platform, temp_dir):
     opts = {}
     
     # 1. Define candidate files based on the platform
-    candidate_files = []
-    if platform == 'instagram':
-        candidate_files = [
-            'cookies/instagram.com_cookies.txt',
-            'cookies/www.instagram.com_cookies.txt',
-            'cookies/instagram.com_cookies.json',
-            'cookies/www.instagram.com_cookies.json',
-        ]
-    elif platform == 'facebook':
-        candidate_files = [
-            'cookies/facebook.com_cookies.txt',
-            'cookies/www.facebook.com_cookies.txt',
-            'cookies/facebook.com_cookies.json',
-            'cookies/www.facebook.com_cookies.json',
-        ]
-    elif platform == 'x':
-        candidate_files = [
-            'cookies/x.com_cookies.txt',
-            'cookies/www.x.com_cookies.txt',
-            'cookies/twitter.com_cookies.txt',
-            'cookies/www.twitter.com_cookies.txt',
-            'cookies/x.com_cookies.json',
-            'cookies/www.x.com_cookies.json',
-            'cookies/twitter.com_cookies.json',
-            'cookies/www.twitter.com_cookies.json',
-        ]
-    elif platform == 'reddit':
-        candidate_files = [
-            'cookies/reddit.com_cookies.txt',
-            'cookies/www.reddit.com_cookies.txt',
-            'cookies/reddit.com_cookies.json',
-            'cookies/www.reddit.com_cookies.json',
-        ]
+    candidate_files = _get_candidate_cookie_files(platform)
 
     # 2. Check if any candidate file exists
     for cookie_file in candidate_files:
