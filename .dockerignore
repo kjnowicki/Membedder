@@ -1,10 +1,13 @@
 .git
+.github
 .gitignore
 .dockerignore
 .venv
-__pycache__
+__pycache__/
 temp/
+_deploy/
 cookies/
+data/
 .env
 *.mp4
 *.mp3
