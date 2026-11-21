@@ -4,7 +4,7 @@ import shutil
 import asyncio
 import subprocess
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 # Import platform handlers
@@ -12,13 +12,41 @@ from sites.instagram import handle_instagram
 from sites.x import handle_x
 from sites.reddit import handle_reddit
 from sites.facebook import handle_facebook
-from carousel import MediaCarouselView
+from carousel import (
+    ExpandCarouselButton,
+    build_single_slide_payload,
+    create_expand_view,
+)
+from config import (
+    is_registered_admin,
+    get_tracking_hours,
+    get_tracking_seconds,
+    set_tracking_hours,
+    reset_tracking_hours,
+    parse_duration_to_hours,
+    format_tracking_duration,
+)
+from tracker import EmbedTracker
+
+load_dotenv(override=False)
+
+tracker = EmbedTracker()
+ExpandCarouselButton.bind_tracker(tracker)
+
+
+class MembedderBot(commands.Bot):
+    async def setup_hook(self):
+        self.add_dynamic_items(ExpandCarouselButton)
+        if not cleanup_expired_embeds.is_running():
+            cleanup_expired_embeds.start()
+
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = MembedderBot(command_prefix="!", intents=intents)
 
 URL_REGEX = r'(https?://(?:www\.|m\.)?(?:instagram\.com|x\.com|twitter\.com|reddit\.com|old\.reddit\.com|v\.redd\.it|facebook\.com|fb\.watch)/[^\s<>]+)'
+
 
 def truncate_text(text, max_chars=200, max_lines=3):
     if not text:
@@ -30,11 +58,12 @@ def truncate_text(text, max_chars=200, max_lines=3):
             text = truncated + "\n[...]"
         else:
             text = truncated
-            
+
     if len(text) > max_chars:
         text = text[:max_chars - 6].rstrip()
         text += " [...]"
     return text
+
 
 async def compress_video(input_path, output_path, target_size_mb=24):
     target_size_bytes = target_size_mb * 1024 * 1024
@@ -66,6 +95,7 @@ async def compress_video(input_path, output_path, target_size_mb=24):
     for log_file in os.listdir('.'):
         if log_file.startswith('ffmpeg2pass'):
             os.remove(log_file)
+
 
 async def prepare_media_file(filepath, height_hint=None):
     """
@@ -102,15 +132,98 @@ async def prepare_media_file(filepath, height_hint=None):
     return final_filepath, False, height
 
 
+async def resolve_channel(channel_id):
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception:
+            return None
+    return channel
+
+
+async def expire_tracked_embeds():
+    """
+    Processes all tracked embeds whose tracking window has ended:
+    removes the expand button (if unexpanded) and cleans up predownloaded images.
+    """
+    expired_entries = tracker.pop_expired()
+    for entry in expired_entries:
+        orig_id = entry.get('original_message_id')
+        ExpandCarouselButton._locks.pop(orig_id, None)
+
+        if entry.get('carousel'):
+            channel = await resolve_channel(entry['channel_id'])
+            if channel is not None:
+                for bot_msg_id in entry.get('bot_message_ids', []):
+                    try:
+                        await channel.get_partial_message(bot_msg_id).edit(view=None)
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+            EmbedTracker.cleanup_carousel_dir(entry)
+
+
+async def handle_deleted_message_ids(channel_id, message_ids):
+    """
+    When a tracked original message is deleted, deletes the bot's embedding
+    message(s) and cleans up any predownloaded carousel images.
+    """
+    channel = None
+    for msg_id in message_ids:
+        entry = tracker.pop_by_original_message(msg_id)
+        if entry is not None:
+            ExpandCarouselButton._locks.pop(msg_id, None)
+            if channel is None:
+                channel = await resolve_channel(entry.get('channel_id', channel_id))
+            if channel is not None:
+                for bot_msg_id in entry.get('bot_message_ids', []):
+                    try:
+                        await channel.get_partial_message(bot_msg_id).delete()
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+            EmbedTracker.cleanup_carousel_dir(entry)
+        else:
+            tracker.remove_bot_message_id(msg_id)
+
+
+@tasks.loop(seconds=30)
+async def cleanup_expired_embeds():
+    try:
+        await expire_tracked_embeds()
+    except Exception as e:
+        print(f"[TRACKER] Error during expiry sweep: {e}")
+
+
+@cleanup_expired_embeds.before_loop
+async def before_cleanup_expired_embeds():
+    await bot.wait_until_ready()
+
+
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user.name} ({bot.user.id})')
     if not os.path.exists('temp'):
         os.makedirs('temp')
-    else:
-        for entry in os.listdir('temp'):
-            if entry.startswith('carousel_'):
-                shutil.rmtree(os.path.join('temp', entry), ignore_errors=True)
+
+    await expire_tracked_embeds()
+
+    # Remove only orphaned carousel_* temp folders not referenced by active tracked embeds
+    active_dirs = tracker.active_carousel_dirs()
+    for entry in os.listdir('temp'):
+        if entry.startswith('carousel_'):
+            full_path = os.path.abspath(os.path.join('temp', entry))
+            if full_path not in active_dirs:
+                shutil.rmtree(full_path, ignore_errors=True)
+
+
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    await handle_deleted_message_ids(payload.channel_id, [payload.message_id])
+
+
+@bot.event
+async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent):
+    await handle_deleted_message_ids(payload.channel_id, list(payload.message_ids))
 
 
 @bot.event
@@ -137,7 +250,9 @@ async def on_message(message):
                     if res.get('error'):
                         print(f"Error handling URL {url}: {res['error']}")
 
-                    # Interactive carousel flow for multi-slide posts (e.g. Instagram photo/mixed carousels)
+                    # Multi-slide post (e.g. Instagram carousel):
+                    # Predownload all slides, post only the starting slide (img_index) with an
+                    # author-only button to expand into Option 3 (native Discord gallery).
                     raw_slides = res.get('slides')
                     if raw_slides and len(raw_slides) > 1:
                         raw_start_index = res.get('start_index', 0)
@@ -177,6 +292,7 @@ async def on_message(message):
                                     adjusted_start_index = len(processed_slides)
                                 processed_slides.append(entry)
 
+                        carousel_dir = res.get('carousel_dir')
                         if processed_slides:
                             raw_desc = res.get('description') or res.get('title') or ""
                             cleaned_desc = truncate_text(raw_desc)
@@ -187,32 +303,72 @@ async def on_message(message):
                                 author_name = f"{uploader} (@{uploader_id})"
                             post_url = res.get('webpage_url') or url
 
-                            view = MediaCarouselView(
+                            embed, initial_files = build_single_slide_payload(
                                 slides=processed_slides,
                                 start_index=adjusted_start_index,
                                 author_name=author_name,
                                 post_url=post_url,
                                 description=cleaned_desc,
                                 color=0xE1306C,
-                                cleanup_dir=res.get('carousel_dir'),
+                            )
+                            view = (
+                                create_expand_view(message.id, len(processed_slides))
+                                if len(processed_slides) > 1
+                                else None
                             )
                             try:
-                                embed, initial_files = view.build_slide_payload()
-                                sent_msg = await message.reply(
-                                    embed=embed,
-                                    files=initial_files,
-                                    view=view,
-                                    mention_author=False,
-                                )
-                                view.message = sent_msg
+                                if view is not None:
+                                    sent_msg = await message.reply(
+                                        embed=embed,
+                                        files=initial_files,
+                                        view=view,
+                                        mention_author=False,
+                                    )
+                                else:
+                                    sent_msg = await message.reply(
+                                        embed=embed,
+                                        files=initial_files,
+                                        mention_author=False,
+                                    )
                             except Exception:
-                                view.cleanup_files()
+                                if carousel_dir and os.path.exists(carousel_dir):
+                                    shutil.rmtree(carousel_dir, ignore_errors=True)
                                 raise
+                            finally:
+                                for f in initial_files:
+                                    try:
+                                        f.close()
+                                    except Exception:
+                                        pass
+
+                            carousel_meta = None
+                            if view is not None:
+                                carousel_meta = {
+                                    'carousel_dir': carousel_dir,
+                                    'slides': processed_slides,
+                                    'start_index': adjusted_start_index,
+                                    'author_name': author_name,
+                                    'post_url': post_url,
+                                    'description': cleaned_desc,
+                                    'color': 0xE1306C,
+                                }
+                            elif carousel_dir and os.path.exists(carousel_dir):
+                                shutil.rmtree(carousel_dir, ignore_errors=True)
+
+                            tracker.register(
+                                original_message_id=message.id,
+                                channel_id=message.channel.id,
+                                guild_id=message.guild.id if message.guild else None,
+                                author_id=message.author.id,
+                                bot_message_ids=[sent_msg.id],
+                                ttl_seconds=get_tracking_seconds(),
+                                carousel=carousel_meta,
+                            )
 
                             await message.edit(suppress=True)
                         else:
-                            if res.get('carousel_dir') and os.path.exists(res['carousel_dir']):
-                                shutil.rmtree(res['carousel_dir'], ignore_errors=True)
+                            if carousel_dir and os.path.exists(carousel_dir):
+                                shutil.rmtree(carousel_dir, ignore_errors=True)
                             print(f"No valid carousel slides found for URL: {url}")
                     else:
                         exceeded_limit = False
@@ -232,28 +388,29 @@ async def on_message(message):
 
                         if files_to_upload or exceeded_limit:
                             discord_files = [discord.File(f) for f in files_to_upload]
-                            
+                            sent_msg = None
+
                             # Custom layout for X/Twitter posts
                             if "x.com" in url or "twitter.com" in url:
                                 raw_desc = res.get('description') or res.get('title') or ""
                                 # Remove trailing t.co short links if they are at the end
                                 cleaned_desc = re.sub(r'\s*https://t\.co/\w+\s*$', '', raw_desc)
                                 cleaned_desc = truncate_text(cleaned_desc)
-                                
+
                                 embed = discord.Embed(
                                     description=cleaned_desc,
                                     color=0x1DA1F2  # X / Twitter blue color
                                 )
-                                
+
                                 uploader = res.get('uploader')
                                 uploader_id = res.get('uploader_id')
                                 author_name = uploader or uploader_id or "X User"
                                 if uploader and uploader_id and uploader.lower() != uploader_id.lower():
                                     author_name = f"{uploader} (@{uploader_id})"
-                                    
+
                                 post_url = res.get('webpage_url') or url
                                 embed.set_author(name=author_name, url=post_url)
-                                
+
                                 if exceeded_limit:
                                     thumbnail_url = res.get('thumbnail')
                                     if thumbnail_url:
@@ -263,21 +420,21 @@ async def on_message(message):
                                     if height:
                                         footer_text += f" ({height}px)"
                                     embed.set_footer(text=footer_text)
-                                    
-                                await message.reply(embed=embed, files=discord_files, mention_author=False)
+
+                                sent_msg = await message.reply(embed=embed, files=discord_files, mention_author=False)
                             elif "reddit.com" in url or "old.reddit.com" in url or "v.redd.it" in url:
                                 raw_desc = res.get('title') or ""
                                 cleaned_desc = truncate_text(raw_desc)
-                                
+
                                 embed = discord.Embed(
                                     description=cleaned_desc,
                                     color=0xFF4500  # Reddit Orangered color
                                 )
-                                
+
                                 subreddit = res.get('subreddit') or "r/reddit"
                                 post_url = res.get('webpage_url') or url
                                 embed.set_author(name=subreddit, url=post_url)
-                                
+
                                 if exceeded_limit:
                                     thumbnail_url = res.get('thumbnail')
                                     if thumbnail_url:
@@ -287,26 +444,26 @@ async def on_message(message):
                                     if height:
                                         footer_text += f" ({height}px)"
                                     embed.set_footer(text=footer_text)
-                                    
-                                await message.reply(embed=embed, files=discord_files, mention_author=False)
+
+                                sent_msg = await message.reply(embed=embed, files=discord_files, mention_author=False)
                             elif "instagram.com" in url:
                                 raw_desc = res.get('description') or res.get('title') or ""
                                 cleaned_desc = truncate_text(raw_desc)
-                                
+
                                 embed = discord.Embed(
                                     description=cleaned_desc,
                                     color=0xE1306C  # Instagram Cherry Pink color
                                 )
-                                
+
                                 uploader = res.get('uploader')
                                 uploader_id = res.get('uploader_id')
                                 author_name = uploader or uploader_id or "Instagram User"
                                 if uploader and uploader_id and uploader.lower() != uploader_id.lower():
                                     author_name = f"{uploader} (@{uploader_id})"
-                                    
+
                                 post_url = res.get('webpage_url') or url
                                 embed.set_author(name=author_name, url=post_url)
-                                
+
                                 if exceeded_limit:
                                     thumbnail_url = res.get('thumbnail')
                                     if thumbnail_url:
@@ -319,26 +476,26 @@ async def on_message(message):
                                 elif len(files_to_upload) == 1 and files_to_upload[0].lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif')):
                                     img_name = os.path.basename(files_to_upload[0])
                                     embed.set_image(url=f"attachment://{img_name}")
-                                    
-                                await message.reply(embed=embed, files=discord_files, mention_author=False)
+
+                                sent_msg = await message.reply(embed=embed, files=discord_files, mention_author=False)
                             elif "facebook.com" in url or "fb.watch" in url:
                                 raw_desc = res.get('description') or res.get('title') or ""
                                 cleaned_desc = truncate_text(raw_desc)
-                                
+
                                 embed = discord.Embed(
                                     description=cleaned_desc,
                                     color=0x1877F2  # Facebook Blue color
                                 )
-                                
+
                                 uploader = res.get('uploader')
                                 uploader_id = res.get('uploader_id')
                                 author_name = uploader or uploader_id or "Facebook User"
                                 if uploader and uploader_id and uploader.lower() != uploader_id.lower():
                                     author_name = f"{uploader} (@{uploader_id})"
-                                    
+
                                 post_url = res.get('webpage_url') or url
                                 embed.set_author(name=author_name, url=post_url)
-                                
+
                                 if exceeded_limit:
                                     thumbnail_url = res.get('thumbnail')
                                     if thumbnail_url:
@@ -348,8 +505,8 @@ async def on_message(message):
                                     if height:
                                         footer_text += f" ({height}px)"
                                     embed.set_footer(text=footer_text)
-                                    
-                                await message.reply(embed=embed, files=discord_files, mention_author=False)
+
+                                sent_msg = await message.reply(embed=embed, files=discord_files, mention_author=False)
                             else:
                                 if exceeded_limit:
                                     embed = discord.Embed(
@@ -364,11 +521,21 @@ async def on_message(message):
                                     if height:
                                         footer_text += f" ({height}px)"
                                     embed.set_footer(text=footer_text)
-                                    await message.reply(embed=embed, mention_author=False)
+                                    sent_msg = await message.reply(embed=embed, mention_author=False)
                                 else:
                                     content = res.get('title')
-                                    await message.reply(content=content, files=discord_files, mention_author=False)
-                                
+                                    sent_msg = await message.reply(content=content, files=discord_files, mention_author=False)
+
+                            if sent_msg is not None:
+                                tracker.register(
+                                    original_message_id=message.id,
+                                    channel_id=message.channel.id,
+                                    guild_id=message.guild.id if message.guild else None,
+                                    author_id=message.author.id,
+                                    bot_message_ids=[sent_msg.id],
+                                    ttl_seconds=get_tracking_seconds(),
+                                )
+
                             await message.edit(suppress=True)
                             for f in res.get('files', []):
                                 if os.path.exists(f):
@@ -390,6 +557,87 @@ async def on_message(message):
             await message.clear_reactions()
     await bot.process_commands(message)
 
-load_dotenv(override=False)
+
+def registered_admin_only():
+    async def predicate(ctx):
+        return is_registered_admin(ctx.author.id)
+    return commands.check(predicate)
+
+
+@bot.group(name="tracking", invoke_without_command=True)
+@registered_admin_only()
+async def tracking_cmd(ctx):
+    """Shows current embed tracking configuration and stats (registered admins only)."""
+    hours = get_tracking_hours()
+    total, expandable = tracker.stats()
+    await ctx.reply(
+        f"Embed tracking window: **{format_tracking_duration(hours)}**\n"
+        f"Currently tracked embeds: **{total}** (expandable carousels: **{expandable}**)\n"
+        "Commands: `!tracking set <duration>` (e.g. `24`, `12h`, `30m`, `2d`) | `!tracking reset`",
+        mention_author=False,
+    )
+
+
+@tracking_cmd.command(name="status")
+@registered_admin_only()
+async def tracking_status(ctx):
+    """Alias for !tracking."""
+    await tracking_cmd.callback(ctx)
+
+
+@tracking_cmd.command(name="set")
+@registered_admin_only()
+async def tracking_set(ctx, duration: str):
+    """Sets the embed tracking duration (registered admins only)."""
+    try:
+        hours = parse_duration_to_hours(duration)
+    except ValueError:
+        await ctx.reply(
+            "Invalid duration. Provide hours as a number or with a unit (`s`, `m`, `h`, `d`), e.g. `!tracking set 24`, `!tracking set 12h`, `!tracking set 30m`.",
+            mention_author=False,
+        )
+        return
+
+    set_tracking_hours(hours)
+    tracker.update_all_expirations(hours * 3600.0)
+    await expire_tracked_embeds()
+    await ctx.reply(
+        f"Embed tracking window updated to **{format_tracking_duration(hours)}**.",
+        mention_author=False,
+    )
+
+
+@tracking_cmd.command(name="reset")
+@registered_admin_only()
+async def tracking_reset(ctx):
+    """Resets the embed tracking duration back to 24 hours (registered admins only)."""
+    hours = reset_tracking_hours()
+    tracker.update_all_expirations(hours * 3600.0)
+    await expire_tracked_embeds()
+    await ctx.reply(
+        f"Embed tracking window reset to default (**{format_tracking_duration(hours)}**).",
+        mention_author=False,
+    )
+
+
+@tracking_cmd.error
+@tracking_status.error
+@tracking_set.error
+@tracking_reset.error
+async def tracking_cmd_error(ctx, error):
+    if isinstance(error, commands.CheckFailure):
+        await ctx.reply(
+            "Only registered bot admins (configured via `ADMIN_USER_IDS` in `.env`) can use this command.",
+            mention_author=False,
+        )
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.reply(
+            "Please specify a duration, e.g. `!tracking set 24`, `!tracking set 12h`, or `!tracking set 30m`.",
+            mention_author=False,
+        )
+    else:
+        print(f"[TRACKING CMD] Error: {error}")
+
+
 TOKEN = str(os.environ.get('DISCORD_BOT_TOKEN'))
 bot.run(TOKEN)
