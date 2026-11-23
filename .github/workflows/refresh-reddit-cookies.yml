@@ -66,9 +66,9 @@ jobs:
             python3 -m venv "$VENV_DIR"
           fi
 
-          if ! "$VENV_DIR/bin/python" -c "import playwright" >/dev/null 2>&1; then
-            echo "Installing playwright into $VENV_DIR..."
-            "$VENV_DIR/bin/pip" install --quiet --upgrade pip playwright
+          if ! "$VENV_DIR/bin/python" -c "import playwright, curl_cffi" >/dev/null 2>&1; then
+            echo "Installing playwright and curl_cffi into $VENV_DIR..."
+            "$VENV_DIR/bin/pip" install --quiet --upgrade pip playwright curl_cffi
           fi
 
           # Ensure Playwright Chromium (and headless shell) matches installed Playwright version

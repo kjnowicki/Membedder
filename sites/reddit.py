@@ -5,6 +5,7 @@ import html
 import asyncio
 import aiohttp
 from urllib.parse import urlparse, urlunparse
+from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from sites.cookies import _get_candidate_cookie_files, load_cookies_dict
 
 def load_reddit_cookies():
@@ -32,26 +33,22 @@ async def get_reddit_json(url):
     return await fetch_reddit_json_by_id(sub, post_id)
 
 async def resolve_and_get_reddit_json(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
     cookies, _ = load_reddit_cookies()
 
-    async with aiohttp.ClientSession(cookies=cookies, headers=headers) as session:
+    async with CurlAsyncSession(impersonate="chrome", cookies=cookies or None, timeout=20) as session:
         try:
-            async with session.get(url, allow_redirects=True) as resp:
-                resolved_url = str(resp.url)
-                return await get_reddit_json(resolved_url)
+            resp = await session.get(url, allow_redirects=True)
+            resolved_url = str(resp.url)
+            if resolved_url == url:
+                print(f"[REDDIT] Short URL {url} did not redirect to a post URL (status {resp.status_code})")
+                return None
+            return await get_reddit_json(resolved_url)
         except Exception as e:
             print(f"[REDDIT] Failed to resolve URL {url}: {e}")
     return None
 
 async def fetch_reddit_json_by_id(sub, post_id):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-
-    # Tier 1: Try using cookies if available
+    # Tier 1: Try using cookies if available (using Chrome TLS impersonation to avoid Fastly/WAF 403)
     cookies, files_exist = load_reddit_cookies()
 
     if not files_exist:
@@ -59,16 +56,16 @@ async def fetch_reddit_json_by_id(sub, post_id):
 
     if cookies:
         api_url = f"https://www.reddit.com/r/{sub}/comments/{post_id}/.json"
-        async with aiohttp.ClientSession(cookies=cookies, headers=headers) as session:
+        async with CurlAsyncSession(impersonate="chrome", cookies=cookies, timeout=20) as session:
             try:
-                async with session.get(api_url) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    
-                    if resp.status in [401, 403, 429]:
-                        print(f"[REDDIT WARNING] Request with cookies returned status {resp.status}. Your cookies might be expired or invalid.")
-                    else:
-                        print(f"[REDDIT] Fetch with cookies returned status {resp.status}")
+                resp = await session.get(api_url)
+                if resp.status_code == 200:
+                    return resp.json()
+
+                if resp.status_code in [401, 403, 429]:
+                    print(f"[REDDIT WARNING] Request with cookies returned status {resp.status_code}. Your cookies might be expired or invalid.")
+                else:
+                    print(f"[REDDIT] Fetch with cookies returned status {resp.status_code}")
             except Exception as e:
                 print(f"[REDDIT] Fetch with cookies failed: {e}")
 
@@ -100,12 +97,12 @@ async def fetch_reddit_json_by_id(sub, post_id):
 
     # Tier 3: Direct fetch without credentials (fallback)
     api_url = f"https://www.reddit.com/r/{sub}/comments/{post_id}/.json"
-    async with aiohttp.ClientSession(headers=headers) as session:
+    async with CurlAsyncSession(impersonate="chrome", timeout=20) as session:
         try:
-            async with session.get(api_url) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                print(f"Direct fetch failed with status {resp.status}")
+            resp = await session.get(api_url)
+            if resp.status_code == 200:
+                return resp.json()
+            print(f"Direct fetch failed with status {resp.status_code}")
         except Exception as e:
             print(f"Direct fetch failed: {e}")
 

@@ -19,19 +19,13 @@ from scripts.refresh_reddit_cookies import (
 from sites.reddit import load_reddit_cookies
 
 
-class _FakeHTTPResponse:
-    def __init__(self, status, body_dict):
-        self.status = status
-        self._raw = json.dumps(body_dict).encode("utf-8")
+class _FakeCurlResponse:
+    def __init__(self, status_code, body_dict):
+        self.status_code = status_code
+        self._body = body_dict
 
-    def read(self):
-        return self._raw
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
+    def json(self):
+        return self._body
 
 
 class TestRedditCookieRefresh(unittest.TestCase):
@@ -128,10 +122,10 @@ class TestRedditCookieRefresh(unittest.TestCase):
     def test_verify_cookies_via_http_success(self):
         cookies = [{"name": "reddit_session", "value": "sess"}]
         responses = [
-            _FakeHTTPResponse(200, {"data": {"name": "dummy_bot"}}),
-            _FakeHTTPResponse(200, {"data": {"children": []}}),
+            _FakeCurlResponse(200, {"data": {"name": "dummy_bot"}}),
+            _FakeCurlResponse(200, {"data": {"children": []}}),
         ]
-        with patch("urllib.request.urlopen", side_effect=responses):
+        with patch("curl_cffi.requests.get", side_effect=responses):
             ok, username, detail = verify_cookies_via_http(cookies)
         self.assertTrue(ok)
         self.assertEqual(username, "dummy_bot")
@@ -139,7 +133,7 @@ class TestRedditCookieRefresh(unittest.TestCase):
 
     def test_verify_cookies_via_http_logged_out(self):
         cookies = [{"name": "reddit_session", "value": "expired"}]
-        with patch("urllib.request.urlopen", return_value=_FakeHTTPResponse(200, {})):
+        with patch("curl_cffi.requests.get", return_value=_FakeCurlResponse(200, {})):
             ok, username, detail = verify_cookies_via_http(cookies)
         self.assertFalse(ok)
         self.assertIsNone(username)

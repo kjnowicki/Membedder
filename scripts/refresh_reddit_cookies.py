@@ -22,8 +22,6 @@ import os
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -227,49 +225,48 @@ def log_cookie_summary(cookies):
             print(f"[REFRESH]   - {name}: session cookie (no fixed expiry)")
 
 
-def verify_cookies_via_http(cookies, user_agent=DEFAULT_USER_AGENT):
+def verify_cookies_via_http(cookies):
     """
-    Verifies exported cookies using a plain HTTP client (similar to aiohttp in Membedder)
-    against Reddit's /api/me.json and a public post listing .json endpoint.
+    Verifies exported cookies using curl_cffi with Chrome TLS impersonation
+    (the exact HTTP stack Membedder uses in sites/reddit.py) against Reddit's
+    /api/me.json and a public post listing .json endpoint.
     Returns (ok, username, detail_message).
     """
-    cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies if c.get("name"))
-    headers = {
-        "User-Agent": user_agent,
-        "Cookie": cookie_header,
-        "Accept": "application/json",
-    }
+    from curl_cffi import requests as curl_requests
+
+    cookie_dict = {c["name"]: c["value"] for c in cookies if c.get("name")}
 
     # 1. Verify logged-in identity
     username = None
     try:
-        req = urllib.request.Request("https://www.reddit.com/api/me.json", headers=headers)
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            if resp.status != 200:
-                return False, None, f"/api/me.json returned HTTP {resp.status}"
-            me_data = json.loads(resp.read().decode("utf-8"))
-            username = (me_data.get("data") or {}).get("name")
-            if not username:
-                return False, None, "/api/me.json indicates session is NOT logged in"
-    except urllib.error.HTTPError as e:
-        return False, None, f"/api/me.json returned HTTP {e.code}"
+        resp = curl_requests.get(
+            "https://www.reddit.com/api/me.json",
+            cookies=cookie_dict,
+            impersonate="chrome",
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return False, None, f"/api/me.json returned HTTP {resp.status_code}"
+        me_data = resp.json()
+        username = (me_data.get("data") or {}).get("name")
+        if not username:
+            return False, None, "/api/me.json indicates session is NOT logged in"
     except Exception as e:
         return False, None, f"/api/me.json request error: {e}"
 
     # 2. Verify a real .json post fetch succeeds
     try:
-        req = urllib.request.Request(
+        resp = curl_requests.get(
             "https://www.reddit.com/r/announcements/top/.json?limit=1",
-            headers=headers,
+            cookies=cookie_dict,
+            impersonate="chrome",
+            timeout=20,
         )
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            if resp.status != 200:
-                return False, username, f"Post JSON test returned HTTP {resp.status}"
-            listing = json.loads(resp.read().decode("utf-8"))
-            if "data" not in listing:
-                return False, username, "Post JSON test returned unexpected structure"
-    except urllib.error.HTTPError as e:
-        return False, username, f"Post JSON test returned HTTP {e.code}"
+        if resp.status_code != 200:
+            return False, username, f"Post JSON test returned HTTP {resp.status_code}"
+        listing = resp.json()
+        if "data" not in listing:
+            return False, username, "Post JSON test returned unexpected structure"
     except Exception as e:
         return False, username, f"Post JSON test error: {e}"
 
