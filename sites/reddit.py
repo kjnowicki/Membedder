@@ -4,41 +4,13 @@ import json
 import html
 import asyncio
 import aiohttp
-import http.cookiejar
 from urllib.parse import urlparse, urlunparse
+from sites.cookies import _get_candidate_cookie_files, load_cookies_dict
 
 def load_reddit_cookies():
-    cookies = {}
-    found_any = False
-    for cookie_file in ['cookies/www.reddit.com_cookies.txt', 'cookies/www.reddit.com_cookies.json']:
-        if os.path.exists(cookie_file):
-            found_any = True
-            # Try loading as JSON first (common format from browser extensions)
-            try:
-                with open(cookie_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        for item in data:
-                            if isinstance(item, dict) and 'name' in item and 'value' in item:
-                                cookies[item['name']] = item['value']
-                        if cookies:
-                            return cookies, True
-            except json.JSONDecodeError:
-                # Not a JSON file, fall through to Netscape format
-                pass
-            except Exception as e:
-                print(f"[REDDIT] Error reading JSON cookies from {cookie_file}: {e}")
-
-            # Fall back to MozillaCookieJar (Netscape text format)
-            try:
-                cookie_jar = http.cookiejar.MozillaCookieJar(cookie_file)
-                cookie_jar.load(ignore_discard=True, ignore_expires=True)
-                for cookie in cookie_jar:
-                    cookies[cookie.name] = cookie.value
-                if cookies:
-                    return cookies, True
-            except Exception as e:
-                print(f"[REDDIT] Error loading cookies from {cookie_file} using MozillaCookieJar: {e}")
+    candidate_files = _get_candidate_cookie_files('reddit')
+    found_any = any(os.path.exists(f) for f in candidate_files)
+    cookies = load_cookies_dict('reddit')
     return cookies, found_any
 
 async def get_reddit_json(url):
