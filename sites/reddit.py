@@ -4,41 +4,14 @@ import json
 import html
 import asyncio
 import aiohttp
-import http.cookiejar
 from urllib.parse import urlparse, urlunparse
+from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from sites.cookies import _get_candidate_cookie_files, load_cookies_dict
 
 def load_reddit_cookies():
-    cookies = {}
-    found_any = False
-    for cookie_file in ['cookies/www.reddit.com_cookies.txt', 'cookies/www.reddit.com_cookies.json']:
-        if os.path.exists(cookie_file):
-            found_any = True
-            # Try loading as JSON first (common format from browser extensions)
-            try:
-                with open(cookie_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        for item in data:
-                            if isinstance(item, dict) and 'name' in item and 'value' in item:
-                                cookies[item['name']] = item['value']
-                        if cookies:
-                            return cookies, True
-            except json.JSONDecodeError:
-                # Not a JSON file, fall through to Netscape format
-                pass
-            except Exception as e:
-                print(f"[REDDIT] Error reading JSON cookies from {cookie_file}: {e}")
-
-            # Fall back to MozillaCookieJar (Netscape text format)
-            try:
-                cookie_jar = http.cookiejar.MozillaCookieJar(cookie_file)
-                cookie_jar.load(ignore_discard=True, ignore_expires=True)
-                for cookie in cookie_jar:
-                    cookies[cookie.name] = cookie.value
-                if cookies:
-                    return cookies, True
-            except Exception as e:
-                print(f"[REDDIT] Error loading cookies from {cookie_file} using MozillaCookieJar: {e}")
+    candidate_files = _get_candidate_cookie_files('reddit')
+    found_any = any(os.path.exists(f) for f in candidate_files)
+    cookies = load_cookies_dict('reddit')
     return cookies, found_any
 
 async def get_reddit_json(url):
@@ -60,26 +33,22 @@ async def get_reddit_json(url):
     return await fetch_reddit_json_by_id(sub, post_id)
 
 async def resolve_and_get_reddit_json(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
     cookies, _ = load_reddit_cookies()
 
-    async with aiohttp.ClientSession(cookies=cookies, headers=headers) as session:
+    async with CurlAsyncSession(impersonate="chrome", cookies=cookies or None, timeout=20) as session:
         try:
-            async with session.get(url, allow_redirects=True) as resp:
-                resolved_url = str(resp.url)
-                return await get_reddit_json(resolved_url)
+            resp = await session.get(url, allow_redirects=True)
+            resolved_url = str(resp.url)
+            if resolved_url == url:
+                print(f"[REDDIT] Short URL {url} did not redirect to a post URL (status {resp.status_code})")
+                return None
+            return await get_reddit_json(resolved_url)
         except Exception as e:
             print(f"[REDDIT] Failed to resolve URL {url}: {e}")
     return None
 
 async def fetch_reddit_json_by_id(sub, post_id):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-
-    # Tier 1: Try using cookies if available
+    # Tier 1: Try using cookies if available (using Chrome TLS impersonation to avoid Fastly/WAF 403)
     cookies, files_exist = load_reddit_cookies()
 
     if not files_exist:
@@ -87,16 +56,16 @@ async def fetch_reddit_json_by_id(sub, post_id):
 
     if cookies:
         api_url = f"https://www.reddit.com/r/{sub}/comments/{post_id}/.json"
-        async with aiohttp.ClientSession(cookies=cookies, headers=headers) as session:
+        async with CurlAsyncSession(impersonate="chrome", cookies=cookies, timeout=20) as session:
             try:
-                async with session.get(api_url) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    
-                    if resp.status in [401, 403, 429]:
-                        print(f"[REDDIT WARNING] Request with cookies returned status {resp.status}. Your cookies might be expired or invalid.")
-                    else:
-                        print(f"[REDDIT] Fetch with cookies returned status {resp.status}")
+                resp = await session.get(api_url)
+                if resp.status_code == 200:
+                    return resp.json()
+
+                if resp.status_code in [401, 403, 429]:
+                    print(f"[REDDIT WARNING] Request with cookies returned status {resp.status_code}. Your cookies might be expired or invalid.")
+                else:
+                    print(f"[REDDIT] Fetch with cookies returned status {resp.status_code}")
             except Exception as e:
                 print(f"[REDDIT] Fetch with cookies failed: {e}")
 
@@ -128,12 +97,12 @@ async def fetch_reddit_json_by_id(sub, post_id):
 
     # Tier 3: Direct fetch without credentials (fallback)
     api_url = f"https://www.reddit.com/r/{sub}/comments/{post_id}/.json"
-    async with aiohttp.ClientSession(headers=headers) as session:
+    async with CurlAsyncSession(impersonate="chrome", timeout=20) as session:
         try:
-            async with session.get(api_url) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                print(f"Direct fetch failed with status {resp.status}")
+            resp = await session.get(api_url)
+            if resp.status_code == 200:
+                return resp.json()
+            print(f"Direct fetch failed with status {resp.status_code}")
         except Exception as e:
             print(f"Direct fetch failed: {e}")
 
